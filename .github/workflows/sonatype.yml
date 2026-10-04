@@ -1,0 +1,92 @@
+name: Sonatype Lifecycle
+
+on:
+  push:
+    branches: [sonatype]
+  pull_request:
+    branches: [sonatype]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Lifecycle stage for the evaluation'
+        type: choice
+        default: build
+        options:
+          - build
+          - stage-release
+          - release
+          - operate
+
+jobs:
+  evaluate:
+    runs-on: [self-hosted, sonatype-demo, pve, docker]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+
+      - name: Configure npm for private nexus registry
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-npmrc
+          NPM_REGISTRY_URL: ${{ vars.NPM_REGISTRY_URL }}
+          NPM_REGISTRY_HOST: ${{ vars.NPM_REGISTRY_HOST }}
+          NPM_AUTH_TOKEN: ${{ secrets.NPM_AUTH_TOKEN }}
+        run: |
+          umask 077
+          {
+            echo "registry=${NPM_REGISTRY_URL}"
+            echo "//${NPM_REGISTRY_HOST}:_auth=${NPM_AUTH_TOKEN}"
+            echo "always-auth=true"
+            echo "audit=false"
+          } > "$NPM_CONFIG_USERCONFIG"
+
+      - name: Install dependencies
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-npmrc
+          BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+          LIFECYCLE_BRANCH_REGEX: '^[a-zA-Z0-9]{6}/[^/]+/[0-9]+(?:\.[0-9]+)*-to-[0-9]+(?:\.[0-9]+)*$'
+        run: |
+          rm -fr node_modules
+          npm cache clean --force
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]] &&
+            node -e 'process.exit(new RegExp(process.env.LIFECYCLE_BRANCH_REGEX).test(process.env.BRANCH_NAME) ? 0 : 1)'; then
+            echo "Lifecycle remediation branch detected: ${BRANCH_NAME}; running npm install"
+            npm install
+          else
+            echo "Regular branch detected: ${BRANCH_NAME}; running npm ci"
+            npm ci
+          fi
+
+      - name: Sonatype Lifecycle evaluate (with JS reachability)
+        id: evaluate
+        uses: sonatype/actions/evaluate@v1
+        with:
+          iq-server-url: ${{ vars.IQ_SERVER_URL }}
+          username: ${{ secrets.LIFECYCLE_USERNAME }}
+          password: ${{ secrets.LIFECYCLE_PASSWORD }}
+          application-id: github-nodegoat__cleygraf
+          stage: ${{ inputs.stage || 'build' }}
+          scan-targets: package.json package-lock.json node_modules
+          enable-reachability-js: true
+          reachability-js-sources: 'app/**/*.js server.js'
+          reachability-js-excludes: '**/*.test.js test/** cypress/**'
+          reachability-js-project-root: '.'
+
+      - name: Fetch SBOM
+        uses: sonatype/actions/fetch-sbom@v1
+        with:
+          iq-server-url: ${{ vars.IQ_SERVER_URL }}
+          username: ${{ secrets.LIFECYCLE_USERNAME }}
+          password: ${{ secrets.LIFECYCLE_PASSWORD }}
+          application-id: github-nodegoat__cleygraf
+          scan-id: ${{ steps.evaluate.outputs.scan-id }}
+          sbom-standard: cyclonedx
+          sbom-format: json
+
+      - name: Remove temporary npm credentials
+        if: always()
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-npmrc
+        run: rm -f "$NPM_CONFIG_USERCONFIG"

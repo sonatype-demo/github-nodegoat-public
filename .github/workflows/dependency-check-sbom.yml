@@ -1,0 +1,143 @@
+name: Generate Sonatype Guide SBOM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-check-sbom-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REPORT_DIR: sonatype-guide-sbom
+  DEPENDENCY_CHECK_IMAGE: owasp/dependency-check:13.0.0@sha256:0e8f69ad5b00d62000937f4e57189812343f6903d9c83ee712012d51542a020a
+
+jobs:
+  generate:
+    name: Run Dependency-Check with Sonatype Guide and create CycloneDX SBOM
+    runs-on: [self-hosted, sonatype-demo, pve, docker, memory-8gb]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+
+      - name: Configure npm for the project dependency tree
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-guide-npmrc
+          NPM_REGISTRY_URL: ${{ vars.NPM_REGISTRY_URL }}
+          NPM_REGISTRY_HOST: ${{ vars.NPM_REGISTRY_HOST }}
+          NPM_AUTH_TOKEN: ${{ secrets.NPM_AUTH_TOKEN }}
+        run: |
+          umask 077
+          {
+            echo "registry=${NPM_REGISTRY_URL}"
+            echo "//${NPM_REGISTRY_HOST}:_auth=${NPM_AUTH_TOKEN}"
+            echo "always-auth=true"
+            echo "audit=false"
+          } > "$NPM_CONFIG_USERCONFIG"
+
+      - name: Install the project dependency tree
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-guide-npmrc
+        run: |
+          rm -rf node_modules
+          npm ci --ignore-scripts --no-audit --no-fund
+          rm -f "$NPM_CONFIG_USERCONFIG"
+
+      - name: Calculate weekly Dependency-Check cache key
+        id: cache-key
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Dependency-Check data
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/dependency-check-data
+          key: dependency-check-v13-${{ runner.os }}-${{ runner.arch }}-${{ steps.cache-key.outputs.week }}
+          restore-keys: |
+            dependency-check-v13-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Prepare report and Dependency-Check data directory
+        run: |
+          rm -rf "$REPORT_DIR"
+          mkdir -p "$REPORT_DIR" "${{ runner.temp }}/dependency-check-data"
+
+      - name: Run OWASP Dependency-Check 13.0.0 with Sonatype Guide
+        env:
+          DC_DATA_DIR: ${{ runner.temp }}/dependency-check-data
+          SONATYPE_GUIDE_TOKEN: ${{ secrets.SONATYPE_GUIDE_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$SONATYPE_GUIDE_TOKEN"
+          runtime_dir="$GITHUB_WORKSPACE/.dependency-check-guide-runtime"
+          properties_file="$runtime_dir/dependency-check.properties"
+          rm -rf "$runtime_dir"
+          mkdir -m 0700 -p "$runtime_dir"
+          umask 077
+          printf '%s\n' \
+            'analyzer.ossindex.enabled=true' \
+            'analyzer.ossindex.url=https://api.guide.sonatype.com' \
+            "analyzer.ossindex.password=$SONATYPE_GUIDE_TOKEN" \
+            'analyzer.ossindex.use.cache=false' \
+            'analyzer.node.audit.enabled=false' \
+            'analyzer.nvdcve.enabled=false' \
+            > "$properties_file"
+          trap 'rm -rf "$runtime_dir"' EXIT
+          args=(
+            --project "github-nodegoat-guide"
+            --scan /src/package.json
+            --scan /src/package-lock.json
+            --format JSON
+            --out /report
+            --propertyfile /run/secrets/dependency-check.properties
+            --nvdDatafeed "https://dependency-check.github.io/DependencyCheck_Builder/nvd_cache/nvdcve-{0}.json.gz"
+          )
+          mounts=(
+            --volume "$GITHUB_WORKSPACE/package.json:/src/package.json:ro"
+            --volume "$GITHUB_WORKSPACE/package-lock.json:/src/package-lock.json:ro"
+            --volume "$GITHUB_WORKSPACE/node_modules:/src/node_modules:ro"
+            --volume "$GITHUB_WORKSPACE/$REPORT_DIR:/report"
+            --volume "$DC_DATA_DIR:/usr/share/dependency-check/data"
+            --volume "$properties_file:/run/secrets/dependency-check.properties:ro"
+          )
+          docker pull "$DEPENDENCY_CHECK_IMAGE"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            "${mounts[@]}" \
+            "$DEPENDENCY_CHECK_IMAGE" \
+            "${args[@]}"
+          test -s "$REPORT_DIR/dependency-check-report.json"
+
+      - name: Convert Guide-enabled Dependency-Check report to CycloneDX 1.6
+        run: |
+          python3 scripts/dependency_check_to_cyclonedx.py \
+            --input "$REPORT_DIR/dependency-check-report.json" \
+            --package-json package.json \
+            --package-lock package-lock.json \
+            --label Guide \
+            --vulnerability-provider "Sonatype Guide" \
+            --require-vulnerability-source OSSINDEX \
+            --output "$REPORT_DIR/guide.cdx.json" \
+            --summary-output "$REPORT_DIR/guide-summary.md"
+          cat "$REPORT_DIR/guide-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Guide report and SBOM
+        uses: actions/upload-artifact@v7
+        with:
+          name: sonatype-guide-sbom
+          path: sonatype-guide-sbom/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary dependencies and credentials
+        if: always()
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-guide-npmrc
+        run: |
+          rm -rf node_modules "$GITHUB_WORKSPACE/.dependency-check-guide-runtime"
+          rm -f "$NPM_CONFIG_USERCONFIG"

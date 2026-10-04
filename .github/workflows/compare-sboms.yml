@@ -1,0 +1,160 @@
+name: Compare Lifecycle and Dependency-Track SBOMs
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Lifecycle stage for the comparison scan
+        type: choice
+        default: build
+        options:
+          - build
+          - stage-release
+          - release
+          - operate
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sbom-comparison-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  COMPARISON_DIR: sbom-comparison
+  SBOM_TOOL_DIR: ${{ github.workspace }}/.github/sbom-tools
+
+jobs:
+  compare:
+    name: Generate and compare CycloneDX SBOMs
+    runs-on: [self-hosted, sonatype-demo, pve, docker, memory-8gb]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+
+      - name: Configure npm for private Nexus registry
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-sbom-npmrc
+          NPM_REGISTRY_URL: ${{ vars.NPM_REGISTRY_URL }}
+          NPM_REGISTRY_HOST: ${{ vars.NPM_REGISTRY_HOST }}
+          NPM_AUTH_TOKEN: ${{ secrets.NPM_AUTH_TOKEN }}
+        run: |
+          umask 077
+          {
+            echo "registry=${NPM_REGISTRY_URL}"
+            echo "//${NPM_REGISTRY_HOST}:_auth=${NPM_AUTH_TOKEN}"
+            echo "always-auth=true"
+            echo "audit=false"
+          } > "$NPM_CONFIG_USERCONFIG"
+
+      - name: Install the project dependency tree
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-sbom-npmrc
+        run: |
+          rm -rf node_modules "$COMPARISON_DIR" "$SBOM_TOOL_DIR/node_modules"
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm ci \
+            --prefix "$SBOM_TOOL_DIR" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund
+          rm -f "$NPM_CONFIG_USERCONFIG"
+          mkdir -p "$COMPARISON_DIR"
+
+      - name: Generate Dependency-Track input SBOM
+        run: |
+          "$SBOM_TOOL_DIR/node_modules/.bin/cyclonedx-npm" \
+            --spec-version 1.6 \
+            --output-format JSON \
+            --output-reproducible \
+            --validate \
+            --output-file "$COMPARISON_DIR/dependency-track-input.cdx.json" \
+            package.json
+
+      - name: Run Sonatype Lifecycle evaluation
+        id: evaluate
+        continue-on-error: true
+        uses: sonatype/actions/evaluate@v1
+        with:
+          iq-server-url: ${{ vars.IQ_SERVER_URL }}
+          username: ${{ secrets.LIFECYCLE_USERNAME }}
+          password: ${{ secrets.LIFECYCLE_PASSWORD }}
+          application-id: github-nodegoat__cleygraf
+          stage: ${{ inputs.stage || 'build' }}
+          scan-targets: package.json package-lock.json node_modules
+
+      - name: Require a completed Lifecycle scan
+        env:
+          SCAN_ID: ${{ steps.evaluate.outputs.scan-id }}
+          CLI_EXIT_CODE: ${{ steps.evaluate.outputs.cli-exit-code }}
+          CLI_EXIT_CATEGORY: ${{ steps.evaluate.outputs.cli-exit-category }}
+        run: |
+          if [[ -z "$SCAN_ID" ]]; then
+            echo "::error::Lifecycle did not return a scan ID (${CLI_EXIT_CATEGORY:-unknown error})."
+            exit 1
+          fi
+          if [[ -n "$CLI_EXIT_CODE" && "$CLI_EXIT_CODE" != "0" && "$CLI_EXIT_CODE" != "1" ]]; then
+            echo "::error::Lifecycle scan failed with ${CLI_EXIT_CATEGORY:-exit code $CLI_EXIT_CODE}."
+            exit 1
+          fi
+          if [[ "$CLI_EXIT_CODE" == "1" ]]; then
+            echo "::warning::Lifecycle completed with a policy violation; comparison will continue."
+          fi
+
+      - name: Fetch Lifecycle CycloneDX SBOM
+        id: lifecycle-sbom
+        uses: sonatype/actions/fetch-sbom@v1
+        with:
+          iq-server-url: ${{ vars.IQ_SERVER_URL }}
+          username: ${{ secrets.LIFECYCLE_USERNAME }}
+          password: ${{ secrets.LIFECYCLE_PASSWORD }}
+          application-id: github-nodegoat__cleygraf
+          scan-id: ${{ steps.evaluate.outputs.scan-id }}
+          sbom-standard: cycloneDx
+          sbom-format: json
+          sbom-version: "1.6"
+          artifact-name: lifecycle-cyclonedx-sbom
+
+      - name: Compare component coverage and enrichment
+        env:
+          LIFECYCLE_SBOM: ${{ steps.lifecycle-sbom.outputs.sbom-file-path }}
+        run: |
+          TOOL_VERSION="$("$SBOM_TOOL_DIR/node_modules/.bin/cyclonedx-npm" --version)"
+          if gzip -t "$LIFECYCLE_SBOM" 2>/dev/null; then
+            gzip -dc "$LIFECYCLE_SBOM" > "$COMPARISON_DIR/lifecycle.cdx.json"
+          else
+            cp "$LIFECYCLE_SBOM" "$COMPARISON_DIR/lifecycle.cdx.json"
+          fi
+          python3 scripts/compare_cyclonedx_sboms.py \
+            --dependency-track "$COMPARISON_DIR/dependency-track-input.cdx.json" \
+            --lifecycle "$COMPARISON_DIR/lifecycle.cdx.json" \
+            --json-output "$COMPARISON_DIR/comparison.json" \
+            --markdown-output "$COMPARISON_DIR/comparison.md"
+          cat "$COMPARISON_DIR/comparison.md" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo
+            echo "## Scan details"
+            echo
+            echo "- Lifecycle stage: \`${{ inputs.stage || 'build' }}\`"
+            echo "- Lifecycle report: ${{ steps.evaluate.outputs.report-url }}"
+            echo "- CycloneDX npm version: \`${TOOL_VERSION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload comparison bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: lifecycle-vs-dependency-track-sboms
+          path: sbom-comparison/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary dependencies and credentials
+        if: always()
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-sbom-npmrc
+        run: |
+          rm -rf node_modules "$SBOM_TOOL_DIR/node_modules"
+          rm -f "$NPM_CONFIG_USERCONFIG"

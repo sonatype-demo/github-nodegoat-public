@@ -1,0 +1,100 @@
+name: Sonatype Lifecycle Container Scan
+
+on:
+  push:
+    branches: [sonatype]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lifecycle-container-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: nodegoat:${{ github.sha }}
+
+jobs:
+  build-and-scan:
+    name: Build image and scan at Stage Release
+    runs-on: [self-hosted, sonatype-demo, pve, docker, memory-8gb]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Configure npm for private Nexus registry
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-container-npmrc
+          NPM_REGISTRY_URL: ${{ vars.NPM_REGISTRY_URL }}
+          NPM_REGISTRY_HOST: ${{ vars.NPM_REGISTRY_HOST }}
+          NPM_AUTH_TOKEN: ${{ secrets.NPM_AUTH_TOKEN }}
+        run: |
+          umask 077
+          {
+            echo "registry=${NPM_REGISTRY_URL}"
+            echo "//${NPM_REGISTRY_HOST}:_auth=${NPM_AUTH_TOKEN}"
+            echo "always-auth=true"
+            echo "audit=false"
+          } > "$NPM_CONFIG_USERCONFIG"
+
+      - name: Build and test NodeGoat
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-container-npmrc
+        run: |
+          rm -rf node_modules
+          npm cache clean --force
+          npm ci
+          npm test
+
+      - name: Build Docker image
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-container-npmrc
+        run: |
+          docker buildx build \
+            --load \
+            --secret "id=npmrc,src=${NPM_CONFIG_USERCONFIG}" \
+            --tag "$IMAGE_NAME" \
+            .
+          docker image inspect "$IMAGE_NAME" \
+            --format 'Built image {{.Id}} ({{.Size}} bytes)'
+
+      - name: Sonatype Lifecycle container evaluation (Stage Release)
+        id: evaluate
+        uses: sonatype/actions/evaluate@v1
+        with:
+          iq-server-url: ${{ vars.IQ_SERVER_URL }}
+          username: ${{ secrets.LIFECYCLE_USERNAME }}
+          password: ${{ secrets.LIFECYCLE_PASSWORD }}
+          application-id: github-nodegoat__cleygraf
+          stage: stage-release
+          scan-targets: container:${{ env.IMAGE_NAME }}
+          advanced-properties: containerScannerMode=sonatype
+          result-file: lifecycle-container-result.json
+
+      - name: Publish scan summary
+        if: always() && steps.evaluate.outputs.report-url
+        env:
+          REPORT_URL: ${{ steps.evaluate.outputs.report-url }}
+        run: |
+          {
+            echo "## Sonatype Lifecycle container scan"
+            echo
+            echo "- Image: \`$IMAGE_NAME\`"
+            echo "- Lifecycle stage: **Stage Release** (\`stage-release\`)"
+            echo "- Report: $REPORT_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary image and npm credentials
+        if: always()
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/nodegoat-container-npmrc
+        run: |
+          docker image rm --force "$IMAGE_NAME" 2>/dev/null || true
+          rm -f "$NPM_CONFIG_USERCONFIG"

@@ -1,0 +1,10 @@
+{
+  "name": "nodegoat-sbom-tools",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned tooling for the SBOM comparison workflow",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@cyclonedx/cyclonedx-npm": "6.0.1"
+  }
+}

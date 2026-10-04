@@ -1,0 +1,31 @@
+name: Lint
+on:
+  push:
+    branches: [sonatype]
+  pull_request:
+    branches: [sonatype]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Node.js
+    runs-on: [self-hosted, sonatype-demo, pve, docker]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["14.x"]
+
+    steps:
+      - name: Checkout https://github.com/${{ github.repository }}@${{ github.ref }}
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Run linter
+        run: npx --no-install jshint@2.12.0 .
