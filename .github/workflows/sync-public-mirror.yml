@@ -55,7 +55,11 @@ jobs:
           GIT_ASKPASS: ${{ runner.temp }}/github-nodegoat-public-askpass
           GIT_TERMINAL_PROMPT: "0"
         run: |
-          git remote add public "https://github.com/${TARGET_REPOSITORY}.git"
+          if git remote get-url public >/dev/null 2>&1; then
+            git remote set-url public "https://github.com/${TARGET_REPOSITORY}.git"
+          else
+            git remote add public "https://github.com/${TARGET_REPOSITORY}.git"
+          fi
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           target_sha=""
@@ -92,4 +96,6 @@ jobs:
         if: always()
         env:
           ASKPASS_PATH: ${{ runner.temp }}/github-nodegoat-public-askpass
-        run: rm -f "$ASKPASS_PATH"
+        run: |
+          git remote remove public 2>/dev/null || true
+          rm -f "$ASKPASS_PATH"
